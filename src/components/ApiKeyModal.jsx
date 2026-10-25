@@ -1,7 +1,23 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext';
-import { testGeminiApiKey } from '../services/gemini';
-import { Key, Eye, EyeOff, CheckCircle2, AlertCircle, ExternalLink, Sparkles, X, ShieldCheck } from 'lucide-react';
+import { 
+  testGeminiApiKey, 
+  fetchAvailableModels, 
+  getStoredModelId, 
+  setStoredModelId 
+} from '../services/gemini';
+import { 
+  Key, 
+  Eye, 
+  EyeOff, 
+  CheckCircle2, 
+  AlertCircle, 
+  ExternalLink, 
+  Sparkles, 
+  X, 
+  ShieldCheck, 
+  Cpu 
+} from 'lucide-react';
 
 export default function ApiKeyModal() {
   const { apiKey, setApiKey, isApiKeyModalOpen, closeApiKeyModal } = useApp();
@@ -9,6 +25,25 @@ export default function ApiKeyModal() {
   const [showKey, setShowKey] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
   const [testResult, setTestResult] = useState(null);
+  const [availableModels, setAvailableModels] = useState([]);
+  const [selectedModel, setSelectedModel] = useState(getStoredModelId() || '');
+
+  useEffect(() => {
+    if (apiKey) {
+      setInputKey(apiKey);
+      // Fetch models in the background
+      fetchAvailableModels(apiKey)
+        .then(models => {
+          setAvailableModels(models);
+          if (models.length > 0 && !selectedModel) {
+            const preferred = models.find(m => m.id.includes('flash')) || models[0];
+            setSelectedModel(preferred.id);
+            setStoredModelId(preferred.id);
+          }
+        })
+        .catch(() => {});
+    }
+  }, [apiKey]);
 
   if (!isApiKeyModalOpen) return null;
 
@@ -21,13 +56,25 @@ export default function ApiKeyModal() {
     setIsTesting(true);
     setTestResult(null);
 
-    const result = await testGeminiApiKey(inputKey.trim());
+    const result = await testGeminiApiKey(inputKey.trim(), selectedModel || null);
     setIsTesting(false);
     setTestResult(result);
+
+    if (result.models && result.models.length > 0) {
+      setAvailableModels(result.models);
+      if (!selectedModel) {
+        const preferred = result.models.find(m => m.id.includes('flash')) || result.models[0];
+        setSelectedModel(preferred.id);
+        setStoredModelId(preferred.id);
+      }
+    }
   };
 
   const handleSave = () => {
     setApiKey(inputKey.trim());
+    if (selectedModel) {
+      setStoredModelId(selectedModel);
+    }
     closeApiKeyModal();
   };
 
@@ -35,6 +82,8 @@ export default function ApiKeyModal() {
     setInputKey('');
     setApiKey('');
     setTestResult(null);
+    setAvailableModels([]);
+    setSelectedModel('');
   };
 
   return (
@@ -75,7 +124,7 @@ export default function ApiKeyModal() {
         <div className="p-3 mb-5 rounded-xl bg-slate-800/60 border border-slate-700/60 text-xs text-slate-300 flex items-start gap-2.5">
           <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
           <span>
-            Your API key is saved exclusively in your browser's <strong>localStorage</strong>. It calls Google Gemini directly from your browser and is never stored on external servers.
+            Your API key is saved exclusively in your browser's <strong>localStorage</strong>. It calls Google Gemini directly and is never sent to any intermediate server.
           </span>
         </div>
 
@@ -108,6 +157,30 @@ export default function ApiKeyModal() {
           </div>
         </div>
 
+        {/* Model Selection Dropdown (if models found) */}
+        {availableModels.length > 0 && (
+          <div className="mb-4 animate-fade-in">
+            <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5 flex items-center gap-1.5">
+              <Cpu className="w-3.5 h-3.5 text-indigo-400" />
+              Active Gemini Model
+            </label>
+            <select
+              value={selectedModel}
+              onChange={(e) => {
+                setSelectedModel(e.target.value);
+                setStoredModelId(e.target.value);
+              }}
+              className="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-xs outline-none focus:border-indigo-500"
+            >
+              {availableModels.map(m => (
+                <option key={m.id} value={m.id} className="bg-slate-900 text-white">
+                  {m.id} {m.id.includes('flash') ? '⚡ (Fast & Recommended)' : ''}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+
         {/* Test Result Message */}
         {testResult && (
           <div
@@ -122,7 +195,7 @@ export default function ApiKeyModal() {
             ) : (
               <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
             )}
-            <span>{testResult.message}</span>
+            <span className="break-all">{testResult.message}</span>
           </div>
         )}
 

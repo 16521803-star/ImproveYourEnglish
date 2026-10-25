@@ -1,109 +1,104 @@
 /**
  * Gemini API Service for English Learning Platform
- * Supports v1beta and v1 endpoints with dynamic model discovery.
+ * Fetches available models from Google API and runs inference.
  */
 
-let cachedEndpoint = null; // { base: string, model: string }
+const STORAGE_SELECTED_MODEL = 'lexiflow_selected_gemini_model';
 
 /**
- * Discovers the active working model and endpoint for the provided API key
+ * Fetch list of all models supporting generateContent for this API key
  */
-export async function discoverActiveModel(apiKey) {
-  if (cachedEndpoint) return cachedEndpoint;
+export async function fetchAvailableModels(apiKey) {
+  if (!apiKey || !apiKey.trim()) return [];
 
   const key = apiKey.trim();
   const versions = ['v1beta', 'v1'];
-  const priorityPreference = [
-    'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-2.0-flash-exp',
-    'gemini-1.5-flash',
-    'gemini-2.5-pro',
-    'gemini-1.5-pro',
-    'gemini-pro'
-  ];
+  let foundModels = [];
+  let lastError = '';
 
-  let lastListError = '';
-
-  // 1. Try querying ListModels API
   for (const ver of versions) {
-    const listUrl = `https://generativelanguage.googleapis.com/${ver}/models?key=${key}`;
     try {
-      const res = await fetch(listUrl);
+      const res = await fetch(`https://generativelanguage.googleapis.com/${ver}/models?key=${key}`);
       if (res.ok) {
         const data = await res.json();
-        const available = (data.models || [])
-          .filter(m => m.supportedGenerationMethods?.includes('generateContent'))
-          .map(m => m.name.replace('models/', ''));
+        const models = (data.models || [])
+          .filter(m => !m.supportedGenerationMethods || m.supportedGenerationMethods.includes('generateContent'))
+          .map(m => {
+            const cleanId = m.name.replace(/^models\//, '');
+            return {
+              id: cleanId,
+              displayName: m.displayName || cleanId,
+              version: ver,
+              description: m.description || '',
+            };
+          })
+          // Filter to only generative chat/text models (exclude embedding/aqa)
+          .filter(m => !m.id.includes('embedding') && !m.id.includes('aqa') && !m.id.includes('imagen'));
 
-        for (const pref of priorityPreference) {
-          if (available.includes(pref)) {
-            cachedEndpoint = { ver, model: pref };
-            return cachedEndpoint;
-          }
-        }
-
-        if (available.length > 0) {
-          cachedEndpoint = { ver, model: available[0] };
-          return cachedEndpoint;
+        if (models.length > 0) {
+          foundModels = models;
+          break;
         }
       } else {
         const errJson = await res.json().catch(() => ({}));
-        lastListError = errJson.error?.message || `HTTP ${res.status}`;
+        lastError = errJson.error?.message || `HTTP ${res.status}`;
       }
     } catch (e) {
-      lastListError = e.message;
+      lastError = e.message;
     }
   }
 
-  // 2. If ListModels wasn't accessible, try testing generateContent directly
-  for (const ver of versions) {
-    for (const model of ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']) {
-      try {
-        const testUrl = `https://generativelanguage.googleapis.com/${ver}/models/${model}:generateContent?key=${key}`;
-        const res = await fetch(testUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: [{ text: 'hi' }] }]
-          }),
-        });
-
-        if (res.ok) {
-          cachedEndpoint = { ver, model };
-          return cachedEndpoint;
-        }
-      } catch (e) {}
-    }
+  if (foundModels.length === 0 && lastError) {
+    throw new Error(lastError);
   }
 
-  // Default fallback
-  return { ver: 'v1beta', model: 'gemini-2.0-flash' };
+  return foundModels;
+}
+
+/**
+ * Get active model ID (stored in localStorage or auto-selected)
+ */
+export function getStoredModelId() {
+  return localStorage.getItem(STORAGE_SELECTED_MODEL) || '';
+}
+
+export function setStoredModelId(modelId) {
+  localStorage.setItem(STORAGE_SELECTED_MODEL, modelId);
 }
 
 /**
  * Generic Gemini API Caller
  */
-export async function callGemini(apiKey, { prompt, systemInstruction = '', responseSchema = null }) {
+export async function callGemini(apiKey, { prompt, systemInstruction = '', responseSchema = null, modelId = null }) {
   if (!apiKey || !apiKey.trim()) {
     throw new Error('Please enter your Gemini API Key in the settings popup.');
   }
 
   const key = apiKey.trim();
-  const endpoint = await discoverActiveModel(key);
+  let selected = modelId || getStoredModelId();
 
-  const candidates = [
-    endpoint,
-    { ver: 'v1beta', model: 'gemini-2.5-flash' },
-    { ver: 'v1beta', model: 'gemini-2.0-flash' },
-    { ver: 'v1beta', model: 'gemini-1.5-flash' },
-    { ver: 'v1', model: 'gemini-1.5-flash' },
-  ];
+  // If no model selected, find one
+  if (!selected) {
+    const list = await fetchAvailableModels(key).catch(() => []);
+    if (list.length > 0) {
+      // Find preferred model
+      const preferred = list.find(m => m.id.includes('2.0-flash')) 
+        || list.find(m => m.id.includes('2.5-flash'))
+        || list.find(m => m.id.includes('1.5-flash'))
+        || list[0];
+      selected = preferred.id;
+      setStoredModelId(selected);
+    } else {
+      selected = 'gemini-2.0-flash';
+    }
+  }
 
+  // Try v1beta first, then v1
+  const versions = ['v1beta', 'v1'];
   let lastErrorMessage = '';
 
-  for (const target of candidates) {
-    const url = `https://generativelanguage.googleapis.com/${target.ver}/models/${target.model}:generateContent?key=${key}`;
+  for (const ver of versions) {
+    const url = `https://generativelanguage.googleapis.com/${ver}/models/${selected}:generateContent?key=${key}`;
 
     const body = {
       contents: [
@@ -140,13 +135,11 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
         const msg = errorData.error?.message || `HTTP ${response.status}: ${response.statusText}`;
         lastErrorMessage = msg;
 
-        // If 404, try next candidate
+        // If 404 on this version, try next version
         if (response.status === 404) {
-          cachedEndpoint = null;
           continue;
         }
 
-        // If bad request or auth error, throw immediately
         throw new Error(msg);
       }
 
@@ -154,10 +147,9 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
       if (!text) {
-        throw new Error('No content returned from Gemini.');
+        throw new Error('No text returned from Gemini API.');
       }
 
-      cachedEndpoint = target;
       return text;
     } catch (err) {
       lastErrorMessage = err.message || 'Network error';
@@ -167,23 +159,33 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
     }
   }
 
-  throw new Error(lastErrorMessage || 'Failed to connect to Google Gemini. Please check your API key.');
+  throw new Error(lastErrorMessage || `Model "${selected}" not found on your API key.`);
 }
 
 /**
- * Verify if the API key works
+ * Verify if the API key works and returns the list of models
  */
-export async function testGeminiApiKey(apiKey) {
+export async function testGeminiApiKey(apiKey, customModel = null) {
   try {
-    cachedEndpoint = null; // force fresh probe
-    const endpoint = await discoverActiveModel(apiKey);
-    const text = await callGemini(apiKey, {
-      prompt: 'Hello! Respond with: {"status": "ok"}',
+    const models = await fetchAvailableModels(apiKey);
+    if (!models || models.length === 0) {
+      throw new Error('No available models found for this API key. Check if Gemini API is enabled in your Google AI Studio.');
+    }
+
+    const targetModel = customModel || models.find(m => m.id.includes('flash'))?.id || models[0].id;
+    setStoredModelId(targetModel);
+
+    // Test a basic generateContent call
+    await callGemini(apiKey, {
+      prompt: 'Respond with exactly: {"status": "ok"}',
       responseSchema: true,
+      modelId: targetModel,
     });
+
     return { 
       success: true, 
-      message: `Connected successfully with model: ${endpoint.model} (${endpoint.ver})` 
+      message: `Connected successfully with model: ${targetModel}`,
+      models 
     };
   } catch (err) {
     return { 
