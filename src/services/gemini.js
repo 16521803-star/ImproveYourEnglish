@@ -1,75 +1,109 @@
 /**
  * Gemini API Service for English Learning Platform
- * Automatically detects available models for the user's API key.
+ * Supports v1beta and v1 endpoints with dynamic model discovery.
  */
 
-let cachedModel = null;
+let cachedEndpoint = null; // { base: string, model: string }
 
 /**
- * Automatically fetch the active working model for the user's API key
+ * Discovers the active working model and endpoint for the provided API key
  */
-export async function getActiveGeminiModel(apiKey) {
-  if (cachedModel) return cachedModel;
+export async function discoverActiveModel(apiKey) {
+  if (cachedEndpoint) return cachedEndpoint;
 
-  try {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey.trim()}`);
-    if (res.ok) {
-      const data = await res.json();
-      const models = data.models || [];
+  const key = apiKey.trim();
+  const versions = ['v1beta', 'v1'];
+  const priorityPreference = [
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-exp',
+    'gemini-1.5-flash',
+    'gemini-2.5-pro',
+    'gemini-1.5-pro',
+    'gemini-pro'
+  ];
 
-      // Filter models that support generateContent
-      const usable = models
-        .filter(m => m.supportedGenerationMethods?.includes('generateContent'))
-        .map(m => m.name.replace('models/', ''));
+  let lastListError = '';
 
-      // Priority list
-      const priorities = [
-        'gemini-2.5-flash',
-        'gemini-2.0-flash',
-        'gemini-2.0-flash-exp',
-        'gemini-1.5-flash',
-        'gemini-1.5-flash-latest',
-        'gemini-1.5-flash-8b',
-        'gemini-pro'
-      ];
+  // 1. Try querying ListModels API
+  for (const ver of versions) {
+    const listUrl = `https://generativelanguage.googleapis.com/${ver}/models?key=${key}`;
+    try {
+      const res = await fetch(listUrl);
+      if (res.ok) {
+        const data = await res.json();
+        const available = (data.models || [])
+          .filter(m => m.supportedGenerationMethods?.includes('generateContent'))
+          .map(m => m.name.replace('models/', ''));
 
-      for (const p of priorities) {
-        if (usable.includes(p)) {
-          cachedModel = p;
-          return p;
+        for (const pref of priorityPreference) {
+          if (available.includes(pref)) {
+            cachedEndpoint = { ver, model: pref };
+            return cachedEndpoint;
+          }
         }
-      }
 
-      if (usable.length > 0) {
-        cachedModel = usable[0];
-        return usable[0];
+        if (available.length > 0) {
+          cachedEndpoint = { ver, model: available[0] };
+          return cachedEndpoint;
+        }
+      } else {
+        const errJson = await res.json().catch(() => ({}));
+        lastListError = errJson.error?.message || `HTTP ${res.status}`;
       }
+    } catch (e) {
+      lastListError = e.message;
     }
-  } catch (e) {
-    console.warn('Could not query model list, using default fallback:', e);
   }
 
-  // Fallback default
-  return 'gemini-2.0-flash';
+  // 2. If ListModels wasn't accessible, try testing generateContent directly
+  for (const ver of versions) {
+    for (const model of ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash']) {
+      try {
+        const testUrl = `https://generativelanguage.googleapis.com/${ver}/models/${model}:generateContent?key=${key}`;
+        const res = await fetch(testUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: 'hi' }] }]
+          }),
+        });
+
+        if (res.ok) {
+          cachedEndpoint = { ver, model };
+          return cachedEndpoint;
+        }
+      } catch (e) {}
+    }
+  }
+
+  // Default fallback
+  return { ver: 'v1beta', model: 'gemini-2.0-flash' };
 }
 
 /**
- * Generic Gemini API Caller with dynamic model resolution
+ * Generic Gemini API Caller
  */
-export async function callGemini(apiKey, { prompt, systemInstruction = '', responseSchema = null, model = null }) {
+export async function callGemini(apiKey, { prompt, systemInstruction = '', responseSchema = null }) {
   if (!apiKey || !apiKey.trim()) {
-    throw new Error('Please provide a valid Gemini API Key.');
+    throw new Error('Please enter your Gemini API Key in the settings popup.');
   }
 
-  const resolvedModel = model || (await getActiveGeminiModel(apiKey));
-  const fallbackList = [resolvedModel, 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-pro'].filter(
-    (v, i, a) => a.indexOf(v) === i
-  );
+  const key = apiKey.trim();
+  const endpoint = await discoverActiveModel(key);
 
-  let lastError = null;
+  const candidates = [
+    endpoint,
+    { ver: 'v1beta', model: 'gemini-2.5-flash' },
+    { ver: 'v1beta', model: 'gemini-2.0-flash' },
+    { ver: 'v1beta', model: 'gemini-1.5-flash' },
+    { ver: 'v1', model: 'gemini-1.5-flash' },
+  ];
 
-  for (const currentModel of fallbackList) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${apiKey.trim()}`;
+  let lastErrorMessage = '';
+
+  for (const target of candidates) {
+    const url = `https://generativelanguage.googleapis.com/${target.ver}/models/${target.model}:generateContent?key=${key}`;
 
     const body = {
       contents: [
@@ -103,37 +137,37 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
-        const errorMessage = errorData.error?.message || `HTTP ${response.status}: ${response.statusText}`;
+        const msg = errorData.error?.message || `HTTP ${response.status}: ${response.statusText}`;
+        lastErrorMessage = msg;
 
-        // If it's a 404 (model not found), reset cache and try next model
+        // If 404, try next candidate
         if (response.status === 404) {
-          cachedModel = null;
+          cachedEndpoint = null;
           continue;
         }
 
-        throw new Error(errorMessage);
+        // If bad request or auth error, throw immediately
+        throw new Error(msg);
       }
 
       const data = await response.json();
-      const candidate = data.candidates?.[0];
-      const text = candidate?.content?.parts?.[0]?.text;
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
       if (!text) {
         throw new Error('No content returned from Gemini.');
       }
 
-      // Save working model
-      cachedModel = currentModel;
+      cachedEndpoint = target;
       return text;
     } catch (err) {
-      lastError = err;
+      lastErrorMessage = err.message || 'Network error';
       if (!err.message?.includes('404') && !err.message?.includes('not found')) {
         throw err;
       }
     }
   }
 
-  throw lastError || new Error('Failed to communicate with Gemini API.');
+  throw new Error(lastErrorMessage || 'Failed to connect to Google Gemini. Please check your API key.');
 }
 
 /**
@@ -141,17 +175,21 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
  */
 export async function testGeminiApiKey(apiKey) {
   try {
-    cachedModel = null; // force fresh lookup
-    const activeModel = await getActiveGeminiModel(apiKey);
-    const response = await callGemini(apiKey, {
-      prompt: 'Respond with exactly: {"status": "ok"}',
-      systemInstruction: 'You are an API health check helper. Output JSON.',
+    cachedEndpoint = null; // force fresh probe
+    const endpoint = await discoverActiveModel(apiKey);
+    const text = await callGemini(apiKey, {
+      prompt: 'Hello! Respond with: {"status": "ok"}',
       responseSchema: true,
-      model: activeModel,
     });
-    return { success: true, message: `Connected successfully using model: ${activeModel}` };
+    return { 
+      success: true, 
+      message: `Connected successfully with model: ${endpoint.model} (${endpoint.ver})` 
+    };
   } catch (err) {
-    return { success: false, message: err.message || 'API Key verification failed.' };
+    return { 
+      success: false, 
+      message: err.message || 'API Key verification failed.' 
+    };
   }
 }
 
@@ -164,7 +202,7 @@ function parseJsonSafe(text) {
     return JSON.parse(cleaned);
   } catch (e) {
     console.error('Failed to parse JSON response:', text);
-    throw new Error('Received invalid JSON format from AI. Please try again.');
+    throw new Error('Received invalid format from AI. Please try again.');
   }
 }
 
