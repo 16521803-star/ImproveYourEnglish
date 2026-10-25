@@ -12,50 +12,38 @@ export async function fetchAvailableModels(apiKey) {
   if (!apiKey || !apiKey.trim()) return [];
 
   const key = apiKey.trim();
-  const versions = ['v1beta', 'v1'];
-  let foundModels = [];
-  let lastError = '';
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models`, {
+      headers: {
+        'x-goog-api-key': key,
+      },
+    });
 
-  for (const ver of versions) {
-    try {
-      const res = await fetch(`https://generativelanguage.googleapis.com/${ver}/models`, {
-        headers: {
-          'x-goog-api-key': key,
-        },
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const models = (data.models || [])
-          .filter(m => !m.supportedGenerationMethods || m.supportedGenerationMethods.includes('generateContent'))
-          .map(m => {
-            const cleanId = m.name.replace(/^models\//, '');
-            return {
-              id: cleanId,
-              displayName: m.displayName || cleanId,
-              version: ver,
-              description: m.description || '',
-            };
-          })
-          .filter(m => !m.id.includes('embedding') && !m.id.includes('aqa') && !m.id.includes('imagen'));
+    if (res.ok) {
+      const data = await res.json();
+      const models = (data.models || [])
+        .filter(m => !m.supportedGenerationMethods || m.supportedGenerationMethods.includes('generateContent'))
+        .map(m => {
+          const cleanId = m.name.replace(/^models\//, '');
+          return {
+            id: cleanId,
+            displayName: m.displayName || cleanId,
+            version: 'v1beta',
+            description: m.description || '',
+          };
+        })
+        .filter(m => !m.id.includes('embedding') && !m.id.includes('aqa') && !m.id.includes('imagen'));
 
-        if (models.length > 0) {
-          foundModels = models;
-          break;
-        }
-      } else {
-        const errJson = await res.json().catch(() => ({}));
-        lastError = errJson.error?.message || `HTTP ${res.status}`;
-      }
-    } catch (e) {
-      lastError = e.message;
+      return models;
+    } else {
+      const errJson = await res.json().catch(() => ({}));
+      const lastError = errJson.error?.message || `HTTP ${res.status}`;
+      throw new Error(lastError);
     }
+  } catch (e) {
+    console.warn('Could not fetch models list:', e.message);
+    return [];
   }
-
-  if (foundModels.length === 0 && lastError) {
-    throw new Error(lastError);
-  }
-
-  return foundModels;
 }
 
 /**
@@ -63,7 +51,8 @@ export async function fetchAvailableModels(apiKey) {
  */
 export function getStoredModelId() {
   const stored = localStorage.getItem(STORAGE_SELECTED_MODEL) || '';
-  if (stored.includes('2.5-flash') || stored.includes('1.5-flash') || stored.includes('2.0-flash')) {
+  // Upgrade legacy or unavailable pro/old models to gemini-3.8-flash
+  if (stored.includes('2.5') || stored.includes('1.5') || stored.includes('2.0') || stored.includes('pro')) {
     return 'gemini-3.8-flash';
   }
   return stored || 'gemini-3.8-flash';
@@ -84,25 +73,22 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
   const key = apiKey.trim();
   let selected = modelId || getStoredModelId();
 
-  // If no model or deprecated, find default
-  if (!selected || selected.includes('2.5') || selected.includes('1.5')) {
+  if (!selected || selected.includes('2.5') || selected.includes('1.5') || selected.includes('pro')) {
     selected = 'gemini-3.8-flash';
   }
 
-  // Model fallback chain if the primary model is busy/overloaded
-  const candidateModels = [
-    selected,
-    'gemini-3.8-flash-lite',
-    'gemini-3.8-flash',
-    'gemini-3.8-pro'
-  ].filter((v, i, a) => a.indexOf(v) === i);
+  // Safe candidates: selected model first, and optionally flash-lite
+  const candidates = [selected];
+  if (selected !== 'gemini-3.8-flash-lite') {
+    candidates.push('gemini-3.8-flash-lite');
+  }
 
-  const versions = ['v1beta', 'v1'];
   let lastErrorMessage = '';
 
-  for (const currentModel of candidateModels) {
-    for (const ver of versions) {
-      const url = `https://generativelanguage.googleapis.com/${ver}/models/${currentModel}:generateContent`;
+  for (const currentModel of candidates) {
+    // Retry up to 2 times on the model if Google returns temporary high demand
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent`;
 
       const body = {
         contents: [
@@ -142,7 +128,6 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
           const msg = errorData.error?.message || `HTTP ${response.status}: ${response.statusText}`;
           lastErrorMessage = msg;
 
-          // If high demand / rate limit / overloaded (429 or 503), wait 1s and try next candidate model!
           const isHighDemand = response.status === 429 || 
                                response.status === 503 || 
                                msg.toLowerCase().includes('high demand') ||
@@ -150,14 +135,14 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
                                msg.toLowerCase().includes('resource');
 
           if (isHighDemand) {
-            console.warn(`[Gemini] ${currentModel} busy (${msg}). Auto-switching to fallback...`);
-            await new Promise(r => setTimeout(r, 1200));
-            break; // Break inner version loop, proceed to next candidate model
+            console.warn(`[Gemini] ${currentModel} busy (attempt ${attempt + 1}). Retrying in 1.5s...`);
+            await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+            continue;
           }
 
-          // If 404 (model not found on this version), try next version
+          // If 404, break to next candidate model
           if (response.status === 404) {
-            continue;
+            break;
           }
 
           throw new Error(msg);
@@ -170,22 +155,26 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
           throw new Error('No text returned from Gemini API.');
         }
 
-        // Remember the working model
         setStoredModelId(currentModel);
         return text;
       } catch (err) {
         lastErrorMessage = err.message || 'Network error';
-        const isRetryable = err.message?.includes('404') || 
-                            err.message?.includes('not found') || 
-                            err.message?.toLowerCase().includes('high demand');
-        if (!isRetryable) {
-          throw err;
+        const isRetryable = err.message?.toLowerCase().includes('high demand') ||
+                            err.message?.toLowerCase().includes('resource') ||
+                            err.message?.toLowerCase().includes('overload');
+        if (isRetryable && attempt < 1) {
+          await new Promise(r => setTimeout(r, 1500));
+          continue;
         }
+        if (err.message?.includes('404')) {
+          break;
+        }
+        throw err;
       }
     }
   }
 
-  throw new Error(lastErrorMessage || 'Gemini servers are currently experiencing high demand. Please retry in a few moments.');
+  throw new Error(lastErrorMessage || 'Gemini service is currently busy. Please try again in a few moments.');
 }
 
 /**
@@ -194,16 +183,12 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
 export async function testGeminiApiKey(apiKey, customModel = null) {
   try {
     const models = await fetchAvailableModels(apiKey);
-    if (!models || models.length === 0) {
-      throw new Error('No available models found for this API key. Check if Gemini API is enabled in your Google AI Studio.');
-    }
-
     const targetModel = customModel 
       || models.find(m => m.id.includes('3.8-flash-lite'))?.id
       || models.find(m => m.id.includes('3.8-flash'))?.id
       || models.find(m => m.id.includes('3.8'))?.id
       || models.find(m => m.id.includes('flash'))?.id 
-      || models[0].id;
+      || 'gemini-3.8-flash';
 
     // Test a basic generateContent call
     await callGemini(apiKey, {
@@ -216,7 +201,7 @@ export async function testGeminiApiKey(apiKey, customModel = null) {
     return { 
       success: true, 
       message: `Connected successfully with model: ${active}`,
-      models 
+      models: models.length > 0 ? models : [{ id: 'gemini-3.8-flash', displayName: 'Gemini 3.8 Flash' }]
     };
   } catch (err) {
     return { 
@@ -237,18 +222,14 @@ function parseJsonSafe(text) {
   try {
     return JSON.parse(cleaned);
   } catch (e) {
-    // Attempt auto-repair on truncated JSON
     try {
       let repaired = cleaned;
-      // Close open string if unclosed
       const quoteMatches = repaired.match(/"/g);
       if (quoteMatches && quoteMatches.length % 2 !== 0) {
         repaired += '"';
       }
-      // Remove trailing comma
       repaired = repaired.replace(/,\s*$/, '');
 
-      // Balance braces and brackets
       let openBrackets = 0;
       let openBraces = 0;
       let inString = false;
