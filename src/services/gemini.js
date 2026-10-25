@@ -1,6 +1,6 @@
 /**
  * Gemini API Service for English Learning Platform
- * Fetches available models from Google API and runs inference.
+ * Fetches available models from Google API and runs inference with auto-retry and high-demand fallback.
  */
 
 const STORAGE_SELECTED_MODEL = 'lexiflow_selected_gemini_model';
@@ -32,7 +32,6 @@ export async function fetchAvailableModels(apiKey) {
               description: m.description || '',
             };
           })
-          // Filter to only generative chat/text models (exclude embedding/aqa)
           .filter(m => !m.id.includes('embedding') && !m.id.includes('aqa') && !m.id.includes('imagen'));
 
         if (models.length > 0) {
@@ -60,7 +59,6 @@ export async function fetchAvailableModels(apiKey) {
  */
 export function getStoredModelId() {
   const stored = localStorage.getItem(STORAGE_SELECTED_MODEL) || '';
-  // Upgrade deprecated models
   if (stored.includes('2.5-flash') || stored.includes('1.5-flash') || stored.includes('2.0-flash')) {
     return 'gemini-3.8-flash';
   }
@@ -72,7 +70,7 @@ export function setStoredModelId(modelId) {
 }
 
 /**
- * Generic Gemini API Caller
+ * Generic Gemini API Caller with High-Demand Auto-Fallback & Retry
  */
 export async function callGemini(apiKey, { prompt, systemInstruction = '', responseSchema = null, modelId = null }) {
   if (!apiKey || !apiKey.trim()) {
@@ -82,89 +80,105 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
   const key = apiKey.trim();
   let selected = modelId || getStoredModelId();
 
-  // If no model selected, find one
-  if (!selected || selected.includes('2.5-flash') || selected.includes('1.5-flash')) {
-    const list = await fetchAvailableModels(key).catch(() => []);
-    if (list.length > 0) {
-      // Find preferred model: gemini-3.8-flash
-      const preferred = list.find(m => m.id.includes('3.8-flash')) 
-        || list.find(m => m.id.includes('3.8'))
-        || list.find(m => m.id.includes('flash'))
-        || list[0];
-      selected = preferred.id;
-      setStoredModelId(selected);
-    } else {
-      selected = 'gemini-3.8-flash';
-    }
+  // If no model or deprecated, find default
+  if (!selected || selected.includes('2.5') || selected.includes('1.5')) {
+    selected = 'gemini-3.8-flash';
   }
 
-  // Try v1beta first, then v1
+  // Model fallback chain if the primary model is busy/overloaded
+  const candidateModels = [
+    selected,
+    'gemini-3.8-flash-lite',
+    'gemini-3.8-flash',
+    'gemini-3.8-pro'
+  ].filter((v, i, a) => a.indexOf(v) === i);
+
   const versions = ['v1beta', 'v1'];
   let lastErrorMessage = '';
 
-  for (const ver of versions) {
-    const url = `https://generativelanguage.googleapis.com/${ver}/models/${selected}:generateContent?key=${key}`;
+  for (const currentModel of candidateModels) {
+    for (const ver of versions) {
+      const url = `https://generativelanguage.googleapis.com/${ver}/models/${currentModel}:generateContent?key=${key}`;
 
-    const body = {
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: prompt }],
+      const body = {
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: prompt }],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 2048,
         },
-      ],
-      generationConfig: {
-        temperature: 0.7,
-        maxOutputTokens: 2048,
-      },
-    };
-
-    if (systemInstruction) {
-      body.systemInstruction = {
-        parts: [{ text: systemInstruction }],
       };
-    }
 
-    if (responseSchema) {
-      body.generationConfig.responseMimeType = 'application/json';
-    }
+      if (systemInstruction) {
+        body.systemInstruction = {
+          parts: [{ text: systemInstruction }],
+        };
+      }
 
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      if (responseSchema) {
+        body.generationConfig.responseMimeType = 'application/json';
+      }
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        const msg = errorData.error?.message || `HTTP ${response.status}: ${response.statusText}`;
-        lastErrorMessage = msg;
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
 
-        // If 404 on this version, try next version
-        if (response.status === 404) {
-          continue;
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          const msg = errorData.error?.message || `HTTP ${response.status}: ${response.statusText}`;
+          lastErrorMessage = msg;
+
+          // If high demand / rate limit / overloaded (429 or 503), wait 1s and try next candidate model!
+          const isHighDemand = response.status === 429 || 
+                               response.status === 503 || 
+                               msg.toLowerCase().includes('high demand') ||
+                               msg.toLowerCase().includes('overloaded') ||
+                               msg.toLowerCase().includes('resource');
+
+          if (isHighDemand) {
+            console.warn(`[Gemini] ${currentModel} busy (${msg}). Auto-switching to fallback...`);
+            await new Promise(r => setTimeout(r, 1200));
+            break; // Break inner version loop, proceed to next candidate model
+          }
+
+          // If 404 (model not found on this version), try next version
+          if (response.status === 404) {
+            continue;
+          }
+
+          throw new Error(msg);
         }
 
-        throw new Error(msg);
-      }
+        const data = await response.json();
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
-      const data = await response.json();
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) {
+          throw new Error('No text returned from Gemini API.');
+        }
 
-      if (!text) {
-        throw new Error('No text returned from Gemini API.');
-      }
-
-      return text;
-    } catch (err) {
-      lastErrorMessage = err.message || 'Network error';
-      if (!err.message?.includes('404') && !err.message?.includes('not found')) {
-        throw err;
+        // Remember the working model
+        setStoredModelId(currentModel);
+        return text;
+      } catch (err) {
+        lastErrorMessage = err.message || 'Network error';
+        const isRetryable = err.message?.includes('404') || 
+                            err.message?.includes('not found') || 
+                            err.message?.toLowerCase().includes('high demand');
+        if (!isRetryable) {
+          throw err;
+        }
       }
     }
   }
 
-  throw new Error(lastErrorMessage || `Model "${selected}" not found on your API key.`);
+  throw new Error(lastErrorMessage || 'Gemini servers are currently experiencing high demand. Please retry in a few moments.');
 }
 
 /**
@@ -178,11 +192,11 @@ export async function testGeminiApiKey(apiKey, customModel = null) {
     }
 
     const targetModel = customModel 
+      || models.find(m => m.id.includes('3.8-flash-lite'))?.id
       || models.find(m => m.id.includes('3.8-flash'))?.id
       || models.find(m => m.id.includes('3.8'))?.id
       || models.find(m => m.id.includes('flash'))?.id 
       || models[0].id;
-    setStoredModelId(targetModel);
 
     // Test a basic generateContent call
     await callGemini(apiKey, {
@@ -191,9 +205,10 @@ export async function testGeminiApiKey(apiKey, customModel = null) {
       modelId: targetModel,
     });
 
+    const active = getStoredModelId() || targetModel;
     return { 
       success: true, 
-      message: `Connected successfully with model: ${targetModel}`,
+      message: `Connected successfully with model: ${active}`,
       models 
     };
   } catch (err) {
