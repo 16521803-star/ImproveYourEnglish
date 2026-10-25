@@ -113,7 +113,7 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
         ],
         generationConfig: {
           temperature: 0.7,
-          maxOutputTokens: 2048,
+          maxOutputTokens: 8192,
         },
       };
 
@@ -227,15 +227,51 @@ export async function testGeminiApiKey(apiKey, customModel = null) {
 }
 
 /**
- * Clean JSON parser that strips markdown code fences if present
+ * Clean JSON parser that strips markdown code fences and attempts auto-repair if truncated
  */
 function parseJsonSafe(text) {
+  if (!text) throw new Error('Received empty response from AI.');
+  
+  const cleaned = text.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+
   try {
-    const cleaned = text.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
     return JSON.parse(cleaned);
   } catch (e) {
-    console.error('Failed to parse JSON response:', text);
-    throw new Error('Received invalid format from AI. Please try again.');
+    // Attempt auto-repair on truncated JSON
+    try {
+      let repaired = cleaned;
+      // Close open string if unclosed
+      const quoteMatches = repaired.match(/"/g);
+      if (quoteMatches && quoteMatches.length % 2 !== 0) {
+        repaired += '"';
+      }
+      // Remove trailing comma
+      repaired = repaired.replace(/,\s*$/, '');
+
+      // Balance braces and brackets
+      let openBrackets = 0;
+      let openBraces = 0;
+      let inString = false;
+      for (let i = 0; i < repaired.length; i++) {
+        if (repaired[i] === '"' && (i === 0 || repaired[i - 1] !== '\\')) {
+          inString = !inString;
+        }
+        if (!inString) {
+          if (repaired[i] === '[') openBrackets++;
+          else if (repaired[i] === ']') openBrackets--;
+          else if (repaired[i] === '{') openBraces++;
+          else if (repaired[i] === '}') openBraces--;
+        }
+      }
+
+      while (openBrackets > 0) { repaired += ']'; openBrackets--; }
+      while (openBraces > 0) { repaired += '}'; openBraces--; }
+
+      return JSON.parse(repaired);
+    } catch (repairErr) {
+      console.error('Failed to parse JSON response:', text);
+      throw new Error('Received invalid format from AI. Please try again.');
+    }
   }
 }
 
