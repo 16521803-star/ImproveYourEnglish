@@ -18,7 +18,11 @@ export async function fetchAvailableModels(apiKey) {
 
   for (const ver of versions) {
     try {
-      const res = await fetch(`https://generativelanguage.googleapis.com/${ver}/models?key=${key}`);
+      const res = await fetch(`https://generativelanguage.googleapis.com/${ver}/models`, {
+        headers: {
+          'x-goog-api-key': key,
+        },
+      });
       if (res.ok) {
         const data = await res.json();
         const models = (data.models || [])
@@ -98,7 +102,7 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
 
   for (const currentModel of candidateModels) {
     for (const ver of versions) {
-      const url = `https://generativelanguage.googleapis.com/${ver}/models/${currentModel}:generateContent?key=${key}`;
+      const url = `https://generativelanguage.googleapis.com/${ver}/models/${currentModel}:generateContent`;
 
       const body = {
         contents: [
@@ -126,7 +130,10 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
       try {
         const response = await fetch(url, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': key,
+          },
           body: JSON.stringify(body),
         });
 
