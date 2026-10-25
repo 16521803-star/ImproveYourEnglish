@@ -1,22 +1,74 @@
 /**
  * Gemini API Service for English Learning Platform
- * Directly calls the Gemini REST API with schema parsing and model fallback.
+ * Automatically detects available models for the user's API key.
  */
 
-const DEFAULT_MODELS = ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'];
+let cachedModel = null;
 
 /**
- * Generic Gemini API Caller
+ * Automatically fetch the active working model for the user's API key
  */
-export async function callGemini(apiKey, { prompt, systemInstruction = '', responseSchema = null, model = 'gemini-2.5-flash' }) {
+export async function getActiveGeminiModel(apiKey) {
+  if (cachedModel) return cachedModel;
+
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey.trim()}`);
+    if (res.ok) {
+      const data = await res.json();
+      const models = data.models || [];
+
+      // Filter models that support generateContent
+      const usable = models
+        .filter(m => m.supportedGenerationMethods?.includes('generateContent'))
+        .map(m => m.name.replace('models/', ''));
+
+      // Priority list
+      const priorities = [
+        'gemini-2.5-flash',
+        'gemini-2.0-flash',
+        'gemini-2.0-flash-exp',
+        'gemini-1.5-flash',
+        'gemini-1.5-flash-latest',
+        'gemini-1.5-flash-8b',
+        'gemini-pro'
+      ];
+
+      for (const p of priorities) {
+        if (usable.includes(p)) {
+          cachedModel = p;
+          return p;
+        }
+      }
+
+      if (usable.length > 0) {
+        cachedModel = usable[0];
+        return usable[0];
+      }
+    }
+  } catch (e) {
+    console.warn('Could not query model list, using default fallback:', e);
+  }
+
+  // Fallback default
+  return 'gemini-2.0-flash';
+}
+
+/**
+ * Generic Gemini API Caller with dynamic model resolution
+ */
+export async function callGemini(apiKey, { prompt, systemInstruction = '', responseSchema = null, model = null }) {
   if (!apiKey || !apiKey.trim()) {
     throw new Error('Please provide a valid Gemini API Key.');
   }
 
-  const modelsToTry = [model, ...DEFAULT_MODELS.filter(m => m !== model)];
+  const resolvedModel = model || (await getActiveGeminiModel(apiKey));
+  const fallbackList = [resolvedModel, 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-pro'].filter(
+    (v, i, a) => a.indexOf(v) === i
+  );
+
   let lastError = null;
 
-  for (const currentModel of modelsToTry) {
+  for (const currentModel of fallbackList) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${currentModel}:generateContent?key=${apiKey.trim()}`;
 
     const body = {
@@ -53,9 +105,9 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
         const errorData = await response.json().catch(() => ({}));
         const errorMessage = errorData.error?.message || `HTTP ${response.status}: ${response.statusText}`;
 
-        // If it's a 404 (model not found), fall back to next model
-        if (response.status === 404 && modelsToTry.indexOf(currentModel) < modelsToTry.length - 1) {
-          console.warn(`Model ${currentModel} not available, trying fallback...`);
+        // If it's a 404 (model not found), reset cache and try next model
+        if (response.status === 404) {
+          cachedModel = null;
           continue;
         }
 
@@ -70,11 +122,12 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
         throw new Error('No content returned from Gemini.');
       }
 
+      // Save working model
+      cachedModel = currentModel;
       return text;
     } catch (err) {
       lastError = err;
-      // If network error or bad request (not 404), throw immediately
-      if (!err.message?.includes('404')) {
+      if (!err.message?.includes('404') && !err.message?.includes('not found')) {
         throw err;
       }
     }
@@ -88,13 +141,15 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
  */
 export async function testGeminiApiKey(apiKey) {
   try {
+    cachedModel = null; // force fresh lookup
+    const activeModel = await getActiveGeminiModel(apiKey);
     const response = await callGemini(apiKey, {
       prompt: 'Respond with exactly: {"status": "ok"}',
       systemInstruction: 'You are an API health check helper. Output JSON.',
       responseSchema: true,
-      model: 'gemini-1.5-flash',
+      model: activeModel,
     });
-    return { success: true, message: 'Gemini API Key is valid and working!' };
+    return { success: true, message: `Connected successfully using model: ${activeModel}` };
   } catch (err) {
     return { success: false, message: err.message || 'API Key verification failed.' };
   }
@@ -105,7 +160,6 @@ export async function testGeminiApiKey(apiKey) {
  */
 function parseJsonSafe(text) {
   try {
-    // If wrapped in ```json ... ```
     const cleaned = text.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
     return JSON.parse(cleaned);
   } catch (e) {
@@ -206,7 +260,7 @@ Your mission is twofold:
 Return ONLY a JSON object with this exact structure:
 {
   "reply": "Your in-character spoken reply to continue the roleplay",
-  "grammarScore": 85, // Integer 1-100 evaluating the user's sentence accuracy
+  "grammarScore": 85,
   "corrections": "Point out any grammar or preposition errors, or 'None! Flawless sentence.' if correct",
   "nativeAlternative": "How a fluent native speaker would naturally say what the user meant",
   "coachTip": "A quick practical tip on vocabulary, idiom, or pronunciation"
@@ -236,8 +290,8 @@ export async function analyzeGrammarDoctor({ apiKey, sentence }) {
 Analyze the user's sentence thoroughly.
 Return ONLY valid JSON with this structure:
 {
-  "isCorrect": true | false,
-  "score": 90, // 1 to 100
+  "isCorrect": true,
+  "score": 90,
   "summary": "Brief 1-sentence verdict",
   "correctedSentence": "The grammatically perfect version",
   "explanation": "Detailed breakdown of mistakes (articles, prepositions, tenses, word order)",
