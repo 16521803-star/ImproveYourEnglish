@@ -59,7 +59,12 @@ export async function fetchAvailableModels(apiKey) {
  * Get active model ID (stored in localStorage or auto-selected)
  */
 export function getStoredModelId() {
-  return localStorage.getItem(STORAGE_SELECTED_MODEL) || '';
+  const stored = localStorage.getItem(STORAGE_SELECTED_MODEL) || '';
+  // Upgrade deprecated models
+  if (stored.includes('2.5-flash') || stored.includes('1.5-flash') || stored.includes('2.0-flash')) {
+    return 'gemini-3.8-flash';
+  }
+  return stored || 'gemini-3.8-flash';
 }
 
 export function setStoredModelId(modelId) {
@@ -78,18 +83,18 @@ export async function callGemini(apiKey, { prompt, systemInstruction = '', respo
   let selected = modelId || getStoredModelId();
 
   // If no model selected, find one
-  if (!selected) {
+  if (!selected || selected.includes('2.5-flash') || selected.includes('1.5-flash')) {
     const list = await fetchAvailableModels(key).catch(() => []);
     if (list.length > 0) {
-      // Find preferred model
-      const preferred = list.find(m => m.id.includes('2.0-flash')) 
-        || list.find(m => m.id.includes('2.5-flash'))
-        || list.find(m => m.id.includes('1.5-flash'))
+      // Find preferred model: gemini-3.8-flash
+      const preferred = list.find(m => m.id.includes('3.8-flash')) 
+        || list.find(m => m.id.includes('3.8'))
+        || list.find(m => m.id.includes('flash'))
         || list[0];
       selected = preferred.id;
       setStoredModelId(selected);
     } else {
-      selected = 'gemini-2.0-flash';
+      selected = 'gemini-3.8-flash';
     }
   }
 
@@ -172,7 +177,11 @@ export async function testGeminiApiKey(apiKey, customModel = null) {
       throw new Error('No available models found for this API key. Check if Gemini API is enabled in your Google AI Studio.');
     }
 
-    const targetModel = customModel || models.find(m => m.id.includes('flash'))?.id || models[0].id;
+    const targetModel = customModel 
+      || models.find(m => m.id.includes('3.8-flash'))?.id
+      || models.find(m => m.id.includes('3.8'))?.id
+      || models.find(m => m.id.includes('flash'))?.id 
+      || models[0].id;
     setStoredModelId(targetModel);
 
     // Test a basic generateContent call

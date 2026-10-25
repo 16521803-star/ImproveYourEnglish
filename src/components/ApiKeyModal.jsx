@@ -35,8 +35,11 @@ export default function ApiKeyModal() {
       fetchAvailableModels(apiKey)
         .then(models => {
           setAvailableModels(models);
-          if (models.length > 0 && !selectedModel) {
-            const preferred = models.find(m => m.id.includes('flash')) || models[0];
+          if (models.length > 0 && (!selectedModel || selectedModel.includes('2.5') || selectedModel.includes('1.5'))) {
+            const preferred = models.find(m => m.id.includes('3.8-flash')) 
+              || models.find(m => m.id.includes('3.8'))
+              || models.find(m => m.id.includes('flash')) 
+              || models[0];
             setSelectedModel(preferred.id);
             setStoredModelId(preferred.id);
           }
@@ -62,8 +65,11 @@ export default function ApiKeyModal() {
 
     if (result.models && result.models.length > 0) {
       setAvailableModels(result.models);
-      if (!selectedModel) {
-        const preferred = result.models.find(m => m.id.includes('flash')) || result.models[0];
+      if (!selectedModel || selectedModel.includes('2.5') || selectedModel.includes('1.5')) {
+        const preferred = result.models.find(m => m.id.includes('3.8-flash')) 
+          || result.models.find(m => m.id.includes('3.8'))
+          || result.models.find(m => m.id.includes('flash')) 
+          || result.models[0];
         setSelectedModel(preferred.id);
         setStoredModelId(preferred.id);
       }
